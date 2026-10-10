@@ -81,3 +81,8 @@ async def resolve_g(url: str, selector: str, cookies: str | None = None,
     # instead of failing the selector when adaptive formats are withheld.
     return await _run(url, f"{selector}/best", [*cargs, *_COOKIE_CLIENTS],
                       timeout, f"{tag}/cookies")
+
+
+# Full media downloader export (routes through utils.media_downloader)
+from utils.media_downloader import download_media
+

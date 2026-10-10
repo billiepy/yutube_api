@@ -1,0 +1,296 @@
+"""Telegram media cache and background upload worker.
+
+Manages MongoDB indexing and caching of resolved YouTube media uploaded to a
+private Telegram channel, guarded by a Redis deduplication lock and an independent
+upload concurrency limiter.
+"""
+import asyncio
+import datetime
+import logging
+import os
+import shutil
+from typing import Optional
+
+from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import DuplicateKeyError
+
+import config
+from config import (
+    API_ID,
+    API_HASH,
+    BOT_TOKEN,
+    MONGO_URI,
+    CACHE_DB_NAME,
+    CACHE_CHANNEL_ID,
+    UPLOAD_CONCURRENCY,
+)
+from tools import get_async_redis, get_async_mongo_client, get_async_mongo_db
+from utils.media_downloader import download_media
+
+logger = logging.getLogger("ytube_api.tg_cache")
+
+# Global upload concurrency limiter (independent from subprocess_slot)
+upload_slot = asyncio.Semaphore(UPLOAD_CONCURRENCY)
+
+_telegram_client = None
+_index_ensured = False
+
+
+# ── MongoDB Helpers & Collection ──────────────────────────────────────────────
+
+async def _ensure_indexes(col) -> None:
+    """Create compound unique index on (video_id, mode) if not already created."""
+    global _index_ensured
+    if not _index_ensured:
+        try:
+            await col.create_index([("video_id", 1), ("mode", 1)], unique=True)
+            _index_ensured = True
+        except Exception as e:
+            logger.warning(f"[TG_CACHE] Failed to ensure index: {e}")
+
+
+async def get_cached_entry(video_id: str, mode: str) -> Optional[dict]:
+    """Retrieve cached Telegram media entry from MongoDB by (video_id, mode)."""
+    try:
+        db = await get_async_mongo_db()
+        col = db["telegram_cache"]
+        await _ensure_indexes(col)
+        doc = await col.find_one({"video_id": video_id, "mode": mode}, {"_id": 0})
+        return doc
+    except Exception as e:
+        logger.error(f"[TG_CACHE] MongoDB lookup error for {video_id}:{mode}: {e}")
+        return None
+
+
+async def save_cached_entry(
+    video_id: str,
+    mode: str,
+    chat_id: int,
+    message_id: int,
+) -> dict:
+    """Upsert cached Telegram media entry into MongoDB.
+
+    Uses MongoDB's compound unique index upsert semantics to handle concurrent
+    worker writes safely without an application-level check-then-insert race.
+    """
+    db = await get_async_mongo_db()
+    col = db["telegram_cache"]
+    await _ensure_indexes(col)
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    entry = {
+        "video_id": video_id,
+        "mode": mode,
+        "telegram_chat_id": int(chat_id),
+        "telegram_message_id": int(message_id),
+        "cached_at": now,
+    }
+
+    try:
+        await col.update_one(
+            {"video_id": video_id, "mode": mode},
+            {
+                "$set": {
+                    "telegram_chat_id": int(chat_id),
+                    "telegram_message_id": int(message_id),
+                    "cached_at": now,
+                },
+                "$setOnInsert": {
+                    "video_id": video_id,
+                    "mode": mode,
+                },
+            },
+            upsert=True,
+        )
+    except DuplicateKeyError:
+        # If a concurrent upsert race won at the index level, update the document
+        await col.update_one(
+            {"video_id": video_id, "mode": mode},
+            {
+                "$set": {
+                    "telegram_chat_id": int(chat_id),
+                    "telegram_message_id": int(message_id),
+                    "cached_at": now,
+                }
+            },
+        )
+
+    logger.info(f"[TG_CACHE] Saved cache entry: {video_id}:{mode} -> msg={message_id}")
+    return entry
+
+
+# ── Telegram Client Management ────────────────────────────────────────────────
+
+def set_telegram_client(client) -> None:
+    """Allow injecting an already initialized Telegram client."""
+    global _telegram_client
+    _telegram_client = client
+
+
+async def get_telegram_client():
+    """Retrieve or lazy-initialize a Telegram client for background uploads.
+
+    If no client has been injected (e.g. FastAPI process running separately from
+    bot.py), a dedicated in-memory client is initialized with no_updates=True so
+    it does not interfere with the long-polling bot process.
+    """
+    global _telegram_client
+    if _telegram_client is not None and getattr(_telegram_client, "is_connected", False):
+        return _telegram_client
+
+    if not BOT_TOKEN:
+        logger.warning("[TG_CACHE] BOT_TOKEN not configured; Telegram client unavailable")
+        return None
+
+    try:
+        from pyrogram import Client
+        client = Client(
+            "ytube_cache_uploader",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            bot_token=BOT_TOKEN,
+            in_memory=True,
+            ipv6=False,
+            no_updates=True,
+        )
+        await client.start()
+        _telegram_client = client
+        logger.info("[TG_CACHE] Started background Telegram cache client")
+        return _telegram_client
+    except Exception as e:
+        logger.error(f"[TG_CACHE] Failed to start Telegram client: {e}")
+        return None
+
+
+async def close_telegram_client() -> None:
+    """Stop the cached Telegram client on shutdown."""
+    global _telegram_client
+    if _telegram_client is not None:
+        try:
+            await _telegram_client.stop()
+        except Exception:
+            pass
+        _telegram_client = None
+
+
+# ── Background Worker with Dedup Lock ─────────────────────────────────────────
+
+async def cache_in_background(video_id: str, mode: str, url: str) -> None:
+    """Fire-and-forget worker to download media and upload it to Telegram cache channel.
+
+    1. Checks if already cached in MongoDB.
+    2. Acquires Redis deduplication lock via SET NX EX to avoid duplicate downloads.
+    3. Acquires upload_slot semaphore to bound concurrent downloads/uploads.
+    4. Downloads full file via download_media.
+    5. Uploads to CACHE_CHANNEL_ID via Telegram client.
+    6. Upserts cache record into MongoDB.
+    7. Cleans up temp file regardless of outcome.
+    8. Releases Redis lock.
+    """
+    # Fire-and-forget safety: catch all exceptions so caller is never blocked or faulted
+    try:
+        # Check if already present in Mongo before acquiring lock
+        existing = await get_cached_entry(video_id, mode)
+        if existing:
+            logger.info(f"[TG_CACHE] {video_id}:{mode} already cached in Mongo, skipping")
+            return
+
+        redis = await get_async_redis()
+        lock_key = f"caching_lock:{video_id}:{mode}"
+        lock_ttl = 600  # 10 minutes TTL safety net
+
+        # 1. Acquire Redis lock
+        acquired = await redis.set(lock_key, "1", nx=True, ex=lock_ttl)
+        if not acquired:
+            logger.info(f"[TG_CACHE] Lock already held for {video_id}:{mode}, skipping background cache")
+            return
+
+        file_path: Optional[str] = None
+        temp_dir: Optional[str] = None
+
+        try:
+            # 2. Concurrency limiting
+            async with upload_slot:
+                logger.info(f"[TG_CACHE] Starting background cache for {video_id} ({mode})")
+
+                # 3. Download the full file
+                file_path = await download_media(url, mode=mode)
+                if not file_path or not os.path.exists(file_path):
+                    logger.error(f"[TG_CACHE] Download failed for {video_id} ({mode})")
+                    return
+                temp_dir = os.path.dirname(file_path)
+
+                channel_id = config.CACHE_CHANNEL_ID
+                if not channel_id:
+                    logger.warning(f"[TG_CACHE] CACHE_CHANNEL_ID is not configured; skipping Telegram upload")
+                    return
+
+                # 4. Upload to Telegram
+                tg_client = await get_telegram_client()
+                if not tg_client:
+                    logger.error(f"[TG_CACHE] Telegram client unavailable; aborting upload for {video_id}")
+                    return
+
+                caption = f"https://www.youtube.com/watch?v={video_id}"
+                msg = None
+
+                if mode == "audio":
+                    try:
+                        msg = await tg_client.send_audio(
+                            chat_id=channel_id,
+                            audio=file_path,
+                            caption=caption,
+                        )
+                    except Exception as e:
+                        logger.warning(f"[TG_CACHE] send_audio failed, trying send_document: {e}")
+                        msg = await tg_client.send_document(
+                            chat_id=channel_id,
+                            document=file_path,
+                            caption=caption,
+                        )
+                else:
+                    try:
+                        msg = await tg_client.send_video(
+                            chat_id=channel_id,
+                            video=file_path,
+                            caption=caption,
+                            supports_streaming=True,
+                        )
+                    except Exception as e:
+                        logger.warning(f"[TG_CACHE] send_video failed, trying send_document: {e}")
+                        msg = await tg_client.send_document(
+                            chat_id=channel_id,
+                            document=file_path,
+                            caption=caption,
+                        )
+
+                if msg:
+                    # 5. Save to MongoDB
+                    chat_id = msg.chat.id
+                    message_id = msg.id
+                    await save_cached_entry(video_id, mode, chat_id, message_id)
+                    logger.info(
+                        f"[TG_CACHE] ✅ Successfully cached {video_id}:{mode} "
+                        f"to chat={chat_id} msg={message_id}"
+                    )
+                else:
+                    logger.error(f"[TG_CACHE] Upload produced no message object for {video_id}")
+
+        finally:
+            # 6. Always clean up temporary files/directory
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            elif file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
+
+            # 7. Release Redis lock
+            try:
+                await redis.delete(lock_key)
+            except Exception as e:
+                logger.debug(f"[TG_CACHE] Failed to delete Redis lock {lock_key}: {e}")
+
+    except Exception as e:
+        logger.error(f"[TG_CACHE] Unexpected error in cache_in_background for {video_id}:{mode}: {e}")

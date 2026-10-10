@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Query, Request, HTTPException, Depends
-from fastapi.responses import JSONResponse, RedirectResponse, FileResponse
+from fastapi.responses import JSONResponse, RedirectResponse, FileResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 import time
 import asyncio
@@ -8,7 +8,7 @@ import datetime
 import hashlib
 import base64
 import threading
-from typing import Optional
+from typing import Optional, AsyncIterator
 import uvicorn
 import inspect
 from fastapi.routing import APIRoute
@@ -78,6 +78,12 @@ async def lifespan(app: FastAPI):
         await close_proxy()
     except Exception:
         pass
+    # Release background Telegram cache client on shutdown.
+    try:
+        from utils.telegram_cache import close_telegram_client
+        await close_telegram_client()
+    except Exception:
+        pass
 
 
 app = FastAPI(
@@ -91,11 +97,13 @@ FREE_PATHS = frozenset([
     "/", "/search", "/trending", "/suggest", "/health",
     "/rate-limit-status", "/docs", "/openapi.json", "/metrics",
     "/favicon.ico", "/favicon.svg",
+    "/youtube/v2/download", "/youtube/jobStatus",
 ])
 
 _FREE_PREFIXES = (
     "/stream/resolver/",
     "/stream/proxy/",
+    "/stream/telegram/",
 )
 
 # ─────────────────────────── Redirect Stream Storage ───────────────────────────
@@ -378,6 +386,14 @@ def _make_temp_proxy(request: Request, stream_id: str) -> str:
         return _make_https_url(request.url_for("stream_resolver", stream_id=stream_id))
     except Exception:
         return f"{BASE_URL}/stream/resolver/{stream_id}"
+
+
+def _make_telegram_stream_url(request: Request, chat_id: int, message_id: int) -> str:
+    from config import BASE_URL
+    try:
+        return _make_https_url(request.url_for("stream_telegram", chat_id=chat_id, message_id=message_id))
+    except Exception:
+        return f"{BASE_URL}/stream/telegram/{chat_id}/{message_id}"
 
 
 async def _make_temp_redirect(request: Request, url: str, mode: str = "video") -> str:
@@ -831,6 +847,122 @@ async def stream_resolver(request: Request, stream_id: str):
     return resp
 
 
+@app.get("/stream/telegram/{chat_id}/{message_id}", name="stream_telegram")
+async def stream_telegram(request: Request, chat_id: int, message_id: int):
+    """Stream media directly from a cached Telegram message."""
+    from utils.telegram_cache import get_telegram_client
+    client = await get_telegram_client()
+    if not client:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Telegram client unavailable"},
+        )
+
+    try:
+        message = await client.get_messages(chat_id=chat_id, message_ids=message_id)
+    except Exception as e:
+        logging.error(f"[STREAM_TELEGRAM] Failed to fetch message {chat_id}/{message_id}: {e}")
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Failed to retrieve message: {e}"},
+        )
+
+    if not message or getattr(message, "empty", False):
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Message not found or empty in Telegram"},
+        )
+
+    media = getattr(message, "audio", None) or getattr(message, "video", None) or getattr(message, "document", None)
+    if not media:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Message contains no downloadable media"},
+        )
+
+    file_size = getattr(media, "file_size", None)
+    default_mime = "video/mp4" if getattr(message, "video", None) else ("audio/mpeg" if getattr(message, "audio", None) else "application/octet-stream")
+    mime_type = getattr(media, "mime_type", None) or default_mime
+    file_name = getattr(media, "file_name", None)
+
+    range_header = request.headers.get("range")
+    if range_header and file_size:
+        import re
+        m = re.match(r"^bytes=(\d+)-(\d+)?$", range_header.strip())
+        if m:
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) is not None else file_size - 1
+            if start >= file_size or start > end:
+                return Response(
+                    status_code=416,
+                    headers={"Content-Range": f"bytes */{file_size}"},
+                )
+            end = min(end, file_size - 1)
+            content_length = end - start + 1
+            chunk_size = 1024 * 1024
+            chunk_offset = start // chunk_size
+            skip_bytes = start % chunk_size
+
+            resp_headers = {
+                "content-type": mime_type,
+                "accept-ranges": "bytes",
+                "content-range": f"bytes {start}-{end}/{file_size}",
+                "content-length": str(content_length),
+            }
+            if file_name:
+                resp_headers["content-disposition"] = f'inline; filename="{file_name}"'
+
+            async def body() -> AsyncIterator[bytes]:
+                bytes_to_send = content_length
+                first_chunk = True
+                try:
+                    async for chunk in client.stream_media(message, offset=chunk_offset):
+                        if first_chunk:
+                            chunk = chunk[skip_bytes:]
+                            first_chunk = False
+                        if len(chunk) > bytes_to_send:
+                            chunk = chunk[:bytes_to_send]
+                        if chunk:
+                            yield chunk
+                            bytes_to_send -= len(chunk)
+                        if bytes_to_send <= 0:
+                            break
+                except (asyncio.CancelledError, GeneratorExit):
+                    raise
+                except Exception as e:
+                    logging.debug(f"[STREAM_TELEGRAM] Transfer interrupted: {e}")
+
+            return StreamingResponse(
+                body(),
+                status_code=206,
+                headers=resp_headers,
+            )
+
+    resp_headers = {
+        "content-type": mime_type,
+        "accept-ranges": "bytes",
+    }
+    if file_size:
+        resp_headers["content-length"] = str(file_size)
+    if file_name:
+        resp_headers["content-disposition"] = f'inline; filename="{file_name}"'
+
+    async def body() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in client.stream_media(message):
+                yield chunk
+        except (asyncio.CancelledError, GeneratorExit):
+            raise
+        except Exception as e:
+            logging.debug(f"[STREAM_TELEGRAM] Transfer interrupted: {e}")
+
+    return StreamingResponse(
+        body(),
+        status_code=200,
+        headers=resp_headers,
+    )
+
+
 @app.get("/stream")
 async def get_stream_url(
     request: Request,
@@ -1125,6 +1257,85 @@ async def rate_limit_status(token: Optional[str] = Query(None, description="Your
             "message": "Please get your token from the Telegram bot using /start command and add it as ?token=YOUR_TOKEN",
             "auth_method": "none"
         }
+
+
+# ─────────────────────────── External Bot Endpoints ───────────────────────────
+
+@app.get("/youtube/v2/download")
+async def youtube_v2_download(
+    request: Request,
+    query: str = Query(..., description="YouTube video ID or URL"),
+    isVideo: str = Query("false", description="'true' for video, 'false' for audio"),
+    api_key: Optional[str] = Query(None, description="API key (accepted for compatibility)"),
+):
+    """External bot download endpoint with Telegram cache check and fallback."""
+    from utils.innertube import extract_id
+    from utils.telegram_cache import get_cached_entry, cache_in_background
+
+    is_video = str(isVideo).strip().lower() in ("true", "1", "yes")
+    is_audio = not is_video
+    mode = "video" if is_video else "audio"
+
+    video_id = extract_id(query)
+    if not video_id:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": "Invalid YouTube video ID or URL"},
+        )
+
+    # 1. Check Telegram cache in MongoDB
+    cached = await get_cached_entry(video_id, mode)
+    if cached and cached.get("telegram_chat_id") and cached.get("telegram_message_id"):
+        cdn_url = _make_telegram_stream_url(
+            request,
+            int(cached["telegram_chat_id"]),
+            int(cached["telegram_message_id"]),
+        )
+        return JSONResponse(content={
+            "status": "success",
+            "job_id": None,
+            "result": {
+                "success": True,
+                "cached": True,
+                "source": "telegram",
+                "cdn": cdn_url,
+                "is_audio": is_audio,
+                "is_video": is_video,
+            }
+        })
+
+    # 2. Cache miss: synchronous stream resolution + fire-and-forget background cache
+    canonical_url = f"https://www.youtube.com/watch?v={video_id}"
+    stream_id = await _ensure_stream_job(canonical_url, mode)
+    stream_url = _make_temp_proxy(request, stream_id)
+
+    # Fire-and-forget non-blocking background caching
+    asyncio.create_task(cache_in_background(video_id, mode, canonical_url))
+
+    return JSONResponse(content={
+        "status": "success",
+        "job_id": None,
+        "result": {
+            "success": True,
+            "cached": False,
+            "source": "ytdlp",
+            "cdn": stream_url,
+            "is_audio": is_audio,
+            "is_video": is_video,
+        }
+    })
+
+
+@app.get("/youtube/jobStatus")
+async def youtube_job_status(
+    api_key: Optional[str] = Query(None, description="API key (compatibility)"),
+    job_id: Optional[str] = Query(None, description="Job ID (compatibility)"),
+):
+    """Job status compatibility endpoint."""
+    return JSONResponse(
+        content={"status": "error", "error": "job not found"},
+        status_code=200,
+    )
 
 
 # ─────────────────────────── Run Services ───────────────────────────

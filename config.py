@@ -73,3 +73,14 @@ YOUTUBE_API_KEYS = os.environ.get("YOUTUBE_API_KEYS", "")
 # ── Optional: Subprocess & Concurrency Tuning ──────────────────
 YTDLP_MAX_PROCS = int(os.environ.get("YTDLP_MAX_PROCS", str((os.cpu_count() or 2) * 2)))
 WEB_CONCURRENCY = int(os.environ.get("WEB_CONCURRENCY", 1))
+
+# ── MongoDB & Telegram Media Cache ─────────────────────────────
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
+CACHE_DB_NAME = os.environ.get("CACHE_DB_NAME", "ytube_cache")
+cache_channel_id_val = os.environ.get("CACHE_CHANNEL_ID")
+try:
+    CACHE_CHANNEL_ID = int(cache_channel_id_val) if cache_channel_id_val else None
+except (ValueError, TypeError):
+    CACHE_CHANNEL_ID = None
+UPLOAD_CONCURRENCY = int(os.environ.get("UPLOAD_CONCURRENCY", 4))
+

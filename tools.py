@@ -40,6 +40,25 @@ async def get_async_redis():
     return _async_redis
 
 
+# ── Mongo client ───────────────────────────────────────────────
+_async_mongo_client = None
+
+
+async def get_async_mongo_client():
+    global _async_mongo_client
+    if _async_mongo_client is None:
+        from motor.motor_asyncio import AsyncIOMotorClient
+        from config import MONGO_URI
+        _async_mongo_client = AsyncIOMotorClient(MONGO_URI)
+    return _async_mongo_client
+
+
+async def get_async_mongo_db():
+    from config import CACHE_DB_NAME
+    client = await get_async_mongo_client()
+    return client[CACHE_DB_NAME]
+
+
 def scan_keys(pattern: str = "*", count: int = 500) -> list[str]:
     """Non-blocking replacement for redis_client.keys() — iterates via SCAN so it
     doesn't stall Redis's single thread on a large keyspace."""
