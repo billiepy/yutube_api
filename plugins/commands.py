@@ -14,7 +14,7 @@ from tools import (
     mask_token, is_group_chat, get_user_token_display,
     send_smart_rich_message
 )
-from config import BASE_URL
+from config import BASE_URL, API_HOST
 
 BOT_START_TIME = time.time()
 
@@ -32,7 +32,8 @@ def get_readable_time(seconds: int) -> str:
 
 
 def api_url(path: str = "") -> str:
-    return f"{BASE_URL}/{path.lstrip('/')}" if path else BASE_URL
+    base = (BASE_URL or f"https://{API_HOST}").rstrip("/")
+    return f"{base}/{path.lstrip('/')}" if path else base
 
 
 def build_main_menu_keyboard() -> InlineKeyboardMarkup:

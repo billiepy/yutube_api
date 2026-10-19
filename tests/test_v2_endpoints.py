@@ -178,3 +178,39 @@ async def test_stream_telegram_route(mock_tg):
         # Non-existent message
         r_404 = await client.get(f"/stream/telegram/{chat_id}/999999")
         assert r_404.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_v2_download_cdn_url_schemes():
+    vid = "dQw4w9WgXcQ"
+    mock_bg = MagicMock(side_effect=lambda *args, **kwargs: asyncio.sleep(0))
+    with patch("utils.telegram_cache.get_cached_entry", new_callable=AsyncMock) as mock_get, \
+         patch("utils.telegram_cache.cache_in_background", new=mock_bg), \
+         patch("main._ensure_stream_job", new_callable=AsyncMock) as mock_ensure:
+        mock_get.return_value = None
+        mock_ensure.return_value = "mock_stream_123"
+
+        # 1. Plain HTTP request -> CDN URL must use http://
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost:8000") as client:
+            r = await client.get(f"/youtube/v2/download?query={vid}&isVideo=false")
+            assert r.status_code == 200
+            cdn = r.json()["result"]["cdn"]
+            assert cdn.startswith("http://localhost:8000/stream/resolver/")
+
+        # 2. Behind TLS reverse proxy (X-Forwarded-Proto: https) -> CDN URL must use https://
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost:8000") as client:
+            r = await client.get(
+                f"/youtube/v2/download?query={vid}&isVideo=false",
+                headers={"x-forwarded-proto": "https", "x-forwarded-host": "api.nubcoders.com"},
+            )
+            assert r.status_code == 200
+            cdn = r.json()["result"]["cdn"]
+            assert cdn.startswith("https://api.nubcoders.com/stream/resolver/")
+
+        # 3. Explicit BASE_URL override in config -> CDN URL uses BASE_URL
+        with patch("config.BASE_URL", "https://custom-domain.com"):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost:8000") as client:
+                r = await client.get(f"/youtube/v2/download?query={vid}&isVideo=false")
+                assert r.status_code == 200
+                cdn = r.json()["result"]["cdn"]
+                assert cdn.startswith("https://custom-domain.com/stream/resolver/")

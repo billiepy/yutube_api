@@ -372,28 +372,61 @@ async def _refresh_stream_url(stream_id: str, job: dict) -> Optional[dict]:
 
 
 def _make_https_url(url_obj) -> str:
-    if hasattr(url_obj, "replace") and not isinstance(url_obj, str):
-        return str(url_obj.replace(scheme="https"))
-    s = str(url_obj)
-    if s.startswith("http://"):
-        return "https://" + s[7:]
-    return s
+    """Deprecated: scheme is preserved dynamically. Kept for backwards compatibility."""
+    return str(url_obj)
+
+
+def _build_external_url(request: Request, route_name: str, fallback_path: str, **path_params) -> str:
+    """Build a full external URL, preferring explicit BASE_URL override if configured,
+
+    otherwise dynamically deriving scheme and host from the incoming request (including
+    forwarded headers if behind a reverse proxy).
+    """
+    from config import BASE_URL
+    if BASE_URL:
+        return f"{BASE_URL.rstrip('/')}/{fallback_path.lstrip('/')}"
+
+    if request:
+        proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+        host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+        try:
+            url = request.url_for(route_name, **path_params)
+            kw = {}
+            if proto:
+                kw["scheme"] = proto
+            if host:
+                kw["netloc"] = host
+            if kw:
+                url = url.replace(**kw)
+            return str(url)
+        except Exception:
+            try:
+                scheme = proto or request.url.scheme
+                netloc = host or request.url.netloc
+                return f"{scheme}://{netloc}/{fallback_path.lstrip('/')}"
+            except Exception:
+                pass
+
+    return f"http://localhost:8000/{fallback_path.lstrip('/')}"
 
 
 def _make_temp_proxy(request: Request, stream_id: str) -> str:
-    from config import BASE_URL
-    try:
-        return _make_https_url(request.url_for("stream_resolver", stream_id=stream_id))
-    except Exception:
-        return f"{BASE_URL}/stream/resolver/{stream_id}"
+    return _build_external_url(
+        request,
+        route_name="stream_resolver",
+        fallback_path=f"stream/resolver/{stream_id}",
+        stream_id=stream_id,
+    )
 
 
 def _make_telegram_stream_url(request: Request, chat_id: int, message_id: int) -> str:
-    from config import BASE_URL
-    try:
-        return _make_https_url(request.url_for("stream_telegram", chat_id=chat_id, message_id=message_id))
-    except Exception:
-        return f"{BASE_URL}/stream/telegram/{chat_id}/{message_id}"
+    return _build_external_url(
+        request,
+        route_name="stream_telegram",
+        fallback_path=f"stream/telegram/{chat_id}/{message_id}",
+        chat_id=chat_id,
+        message_id=message_id,
+    )
 
 
 async def _make_temp_redirect(request: Request, url: str, mode: str = "video") -> str:

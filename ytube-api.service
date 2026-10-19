@@ -1,0 +1,22 @@
+[Unit]
+Description=yutube_api - FastAPI YouTube Streaming & Caching Service
+After=network.target redis-server.service mongod.service
+Wants=redis-server.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/yutube_api
+EnvironmentFile=/root/yutube_api/.env
+Environment="PATH=/root/yutube_api/.venv/bin:/root/.deno/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/root/yutube_api/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
+Restart=on-failure
+RestartSec=5s
+
+# Process security and resource controls
+LimitNOFILE=65536
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
