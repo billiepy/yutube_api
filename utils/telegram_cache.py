@@ -67,6 +67,9 @@ async def save_cached_entry(
     mode: str,
     chat_id: int,
     message_id: int,
+    file_size: Optional[int] = None,
+    mime_type: Optional[str] = None,
+    duration: Optional[int] = None,
 ) -> dict:
     """Upsert cached Telegram media entry into MongoDB.
 
@@ -78,23 +81,29 @@ async def save_cached_entry(
     await _ensure_indexes(col)
 
     now = datetime.datetime.now(datetime.timezone.utc)
-    entry = {
-        "video_id": video_id,
-        "mode": mode,
+    set_fields = {
         "telegram_chat_id": int(chat_id),
         "telegram_message_id": int(message_id),
         "cached_at": now,
+    }
+    if file_size is not None:
+        set_fields["file_size"] = int(file_size)
+    if mime_type is not None:
+        set_fields["mime_type"] = str(mime_type)
+    if duration is not None:
+        set_fields["duration"] = int(duration)
+
+    entry = {
+        "video_id": video_id,
+        "mode": mode,
+        **set_fields,
     }
 
     try:
         await col.update_one(
             {"video_id": video_id, "mode": mode},
             {
-                "$set": {
-                    "telegram_chat_id": int(chat_id),
-                    "telegram_message_id": int(message_id),
-                    "cached_at": now,
-                },
+                "$set": set_fields,
                 "$setOnInsert": {
                     "video_id": video_id,
                     "mode": mode,
@@ -107,11 +116,7 @@ async def save_cached_entry(
         await col.update_one(
             {"video_id": video_id, "mode": mode},
             {
-                "$set": {
-                    "telegram_chat_id": int(chat_id),
-                    "telegram_message_id": int(message_id),
-                    "cached_at": now,
-                }
+                "$set": set_fields,
             },
         )
 
@@ -173,6 +178,47 @@ async def close_telegram_client() -> None:
         _telegram_client = None
 
 
+# ── Metadata Probe ─────────────────────────────────────────────────────────────
+
+async def _probe_media_metadata(file_path: str) -> tuple[Optional[int], Optional[str], Optional[str]]:
+    """Extract duration (int), title (str), and performer (str) via ffprobe (local, fast)."""
+    duration: Optional[int] = None
+    title: Optional[str] = None
+    performer: Optional[str] = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration:stream=duration:format_tags=title,artist,performer,uploader:stream_tags=title,artist,performer,uploader",
+            "-of", "json",
+            file_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0 and stdout:
+            import json
+            data = json.loads(stdout.decode())
+            fmt = data.get("format", {})
+            dur = fmt.get("duration")
+            if dur is None or dur == "N/A":
+                for st in data.get("streams", []):
+                    if st.get("duration") is not None and st.get("duration") != "N/A":
+                        dur = st.get("duration")
+                        break
+            if dur is not None and dur != "N/A":
+                try:
+                    duration = int(round(float(dur)))
+                except (ValueError, TypeError):
+                    pass
+            fmt_tags = fmt.get("tags") or {}
+            title = fmt_tags.get("title")
+            performer = fmt_tags.get("artist") or fmt_tags.get("performer") or fmt_tags.get("uploader")
+    except Exception as e:
+        logger.warning(f"[TG_CACHE] ffprobe metadata extraction failed for {file_path}: {e}")
+    return duration, title, performer
+
+
 # ── Background Worker with Dedup Lock ─────────────────────────────────────────
 
 async def cache_in_background(video_id: str, mode: str, url: str) -> None:
@@ -231,16 +277,28 @@ async def cache_in_background(video_id: str, mode: str, url: str) -> None:
                     logger.error(f"[TG_CACHE] Telegram client unavailable; aborting upload for {video_id}")
                     return
 
-                caption = f"https://www.youtube.com/watch?v={video_id}"
+                # 4. Extract metadata & build caption
+                duration, title, performer = await _probe_media_metadata(file_path)
+                file_size = os.path.getsize(file_path)
+                ext = os.path.splitext(file_path)[1].lstrip(".").lower() or ("m4a" if mode == "audio" else "mp4")
+                size_mb = round(file_size / (1024 * 1024), 2)
+                caption = f"https://www.youtube.com/watch?v={video_id}\n{ext} | {size_mb}MB"
                 msg = None
 
                 if mode == "audio":
+                    audio_kwargs = {
+                        "chat_id": channel_id,
+                        "audio": file_path,
+                        "caption": caption,
+                    }
+                    if duration is not None:
+                        audio_kwargs["duration"] = int(duration)
+                    if title:
+                        audio_kwargs["title"] = str(title)
+                    if performer:
+                        audio_kwargs["performer"] = str(performer)
                     try:
-                        msg = await tg_client.send_audio(
-                            chat_id=channel_id,
-                            audio=file_path,
-                            caption=caption,
-                        )
+                        msg = await tg_client.send_audio(**audio_kwargs)
                     except Exception as e:
                         logger.warning(f"[TG_CACHE] send_audio failed, trying send_document: {e}")
                         msg = await tg_client.send_document(
@@ -249,13 +307,16 @@ async def cache_in_background(video_id: str, mode: str, url: str) -> None:
                             caption=caption,
                         )
                 else:
+                    video_kwargs = {
+                        "chat_id": channel_id,
+                        "video": file_path,
+                        "caption": caption,
+                        "supports_streaming": True,
+                    }
+                    if duration is not None:
+                        video_kwargs["duration"] = int(duration)
                     try:
-                        msg = await tg_client.send_video(
-                            chat_id=channel_id,
-                            video=file_path,
-                            caption=caption,
-                            supports_streaming=True,
-                        )
+                        msg = await tg_client.send_video(**video_kwargs)
                     except Exception as e:
                         logger.warning(f"[TG_CACHE] send_video failed, trying send_document: {e}")
                         msg = await tg_client.send_document(
@@ -268,7 +329,19 @@ async def cache_in_background(video_id: str, mode: str, url: str) -> None:
                     # 5. Save to MongoDB
                     chat_id = msg.chat.id
                     message_id = msg.id
-                    await save_cached_entry(video_id, mode, chat_id, message_id)
+                    media = getattr(msg, "audio", None) or getattr(msg, "video", None) or getattr(msg, "document", None)
+                    msg_file_size = getattr(media, "file_size", None) or file_size
+                    msg_mime_type = getattr(media, "mime_type", None)
+                    msg_duration = getattr(media, "duration", None) or duration
+                    await save_cached_entry(
+                        video_id=video_id,
+                        mode=mode,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        file_size=msg_file_size,
+                        mime_type=msg_mime_type,
+                        duration=msg_duration,
+                    )
                     logger.info(
                         f"[TG_CACHE] ✅ Successfully cached {video_id}:{mode} "
                         f"to chat={chat_id} msg={message_id}"

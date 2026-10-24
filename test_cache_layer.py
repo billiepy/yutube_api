@@ -164,24 +164,24 @@ class MockTelegramClient:
         self.uploads = []
         self._next_msg_id = 100
 
-    async def send_audio(self, chat_id, audio, caption=None):
+    async def send_audio(self, chat_id, audio, caption=None, **kwargs):
         self._next_msg_id += 1
         msg = MockTelegramMessage(chat_id, self._next_msg_id)
-        self.uploads.append({"type": "audio", "file": audio, "caption": caption, "msg": msg})
+        self.uploads.append({"type": "audio", "file": audio, "caption": caption, "msg": msg, **kwargs})
         logger.info(f"[MockTG] send_audio: {audio} -> chat={chat_id} msg={msg.id}")
         return msg
 
-    async def send_video(self, chat_id, video, caption=None, supports_streaming=True):
+    async def send_video(self, chat_id, video, caption=None, supports_streaming=True, **kwargs):
         self._next_msg_id += 1
         msg = MockTelegramMessage(chat_id, self._next_msg_id)
-        self.uploads.append({"type": "video", "file": video, "caption": caption, "msg": msg})
+        self.uploads.append({"type": "video", "file": video, "caption": caption, "msg": msg, **kwargs})
         logger.info(f"[MockTG] send_video: {video} -> chat={chat_id} msg={msg.id}")
         return msg
 
-    async def send_document(self, chat_id, document, caption=None):
+    async def send_document(self, chat_id, document, caption=None, **kwargs):
         self._next_msg_id += 1
         msg = MockTelegramMessage(chat_id, self._next_msg_id)
-        self.uploads.append({"type": "document", "file": document, "caption": caption, "msg": msg})
+        self.uploads.append({"type": "document", "file": document, "caption": caption, "msg": msg, **kwargs})
         logger.info(f"[MockTG] send_document: {document} -> chat={chat_id} msg={msg.id}")
         return msg
 

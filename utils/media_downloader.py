@@ -19,7 +19,7 @@ from utils.ytdlp_runner import _COOKIE_CLIENTS
 logger = logging.getLogger("ytube_api.downloader")
 
 # Format selectors matching cache_manager.py and media_extractor.py
-_AUDIO_SELECTOR = "251/250/bestaudio[ext=m4a]/bestaudio"
+_AUDIO_SELECTOR = "140/bestaudio[ext=m4a]/251/250/bestaudio"
 _VIDEO_SELECTOR = "22/18/best[ext=mp4]"
 
 
