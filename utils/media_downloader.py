@@ -45,6 +45,7 @@ async def _run_download(
 ) -> tuple[Optional[str], Optional[str]]:
     format_file = os.path.join(temp_dir, f".format_id_{time.time_ns()}")
     title_file = os.path.join(temp_dir, ".title")
+    uploader_file = os.path.join(temp_dir, ".uploader")
     output_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
     cmd = [
         "yt-dlp",
@@ -52,6 +53,7 @@ async def _run_download(
         "--remote-components", "ejs:github",
         "--print-to-file", "%(format_id)s", format_file,
         "--print-to-file", "%(title)s", title_file,
+        "--print-to-file", "%(uploader)s", uploader_file,
         *extra,
         "-f", selector,
         "--no-playlist",
