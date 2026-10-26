@@ -6,8 +6,10 @@ upload concurrency limiter.
 """
 import asyncio
 import datetime
+import json
 import logging
 import os
+import re
 import shutil
 from typing import Optional
 
@@ -178,7 +180,76 @@ async def close_telegram_client() -> None:
         _telegram_client = None
 
 
-# ── Metadata Probe ─────────────────────────────────────────────────────────────
+# ── Metadata Probe & Caption Builders ──────────────────────────────────────────
+
+def format_duration(duration_seconds: Optional[int]) -> str:
+    """Format duration in seconds as m:ss (or h:mm:ss if >= 1 hour)."""
+    if not duration_seconds or duration_seconds < 0:
+        return "0:00"
+    m, s = divmod(int(duration_seconds), 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def build_caption(
+    video_id: str,
+    mode: str,
+    ext: str,
+    size_mb: float,
+    duration: Optional[int],
+    title: Optional[str] = None,
+) -> str:
+    """Build Telegram upload caption under 1024 characters.
+
+    Line 1: video title (omitted if no title)
+    Line 2: yt:{video_id}:{mode}
+    Line 3: {ext} | {size_mb}MB | {m:ss}
+    Line 4: https://www.youtube.com/watch?v={video_id}
+    """
+    dur_str = format_duration(duration)
+    metadata_lines = [
+        f"yt:{video_id}:{mode}",
+        f"{ext} | {size_mb}MB | {dur_str}",
+        f"https://www.youtube.com/watch?v={video_id}",
+    ]
+    metadata_block = "\n".join(metadata_lines)
+
+    if not title:
+        return metadata_block
+
+    clean_title = " ".join(str(title).split())
+    if not clean_title:
+        return metadata_block
+
+    # Telegram caption max length is 1024 characters
+    # Max title length is 1024 - len(metadata_block) - 1 (for the newline)
+    max_title_len = 1024 - len(metadata_block) - 1
+    if max_title_len <= 0:
+        return metadata_block
+
+    if len(clean_title) > max_title_len:
+        clean_title = clean_title[:max_title_len]
+
+    return f"{clean_title}\n{metadata_block}"
+
+
+def parse_caption(text: Optional[str]) -> Optional[tuple[str, str]]:
+    """Parse cached Telegram upload caption into (video_id, mode).
+
+    Finds a line matching 'yt:<video_id>:<mode>' where mode is 'audio' or 'video'.
+    Returns (video_id, mode) or None.
+    """
+    if not text or not isinstance(text, str):
+        return None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        m = re.match(r"^yt:([^:\s]+):(audio|video)$", line, re.IGNORECASE)
+        if m:
+            return m.group(1), m.group(2).lower()
+    return None
+
 
 async def _probe_media_metadata(file_path: str) -> tuple[Optional[int], Optional[str], Optional[str]]:
     """Extract duration (int), title (str), and performer (str) via ffprobe (local, fast)."""
@@ -278,11 +349,45 @@ async def cache_in_background(video_id: str, mode: str, url: str) -> None:
                     return
 
                 # 4. Extract metadata & build caption
-                duration, title, performer = await _probe_media_metadata(file_path)
+                duration, ff_title, performer = await _probe_media_metadata(file_path)
+                title: Optional[str] = None
+                if temp_dir and os.path.isdir(temp_dir):
+                    title_file = os.path.join(temp_dir, ".title")
+                    if os.path.exists(title_file):
+                        try:
+                            with open(title_file, "r", encoding="utf-8") as f:
+                                content = f.read().strip()
+                                if content:
+                                    title = content.splitlines()[0].strip()
+                        except Exception as e:
+                            logger.warning(f"[TG_CACHE] Failed to read .title file: {e}")
+                    if not title:
+                        try:
+                            for f in os.listdir(temp_dir):
+                                if f.endswith(".info.json"):
+                                    with open(os.path.join(temp_dir, f), "r", encoding="utf-8") as jf:
+                                        info = json.load(jf)
+                                        t = info.get("title")
+                                        if t and str(t).strip():
+                                            title = str(t).strip()
+                                            break
+                        except Exception:
+                            pass
+
+                if not title and ff_title and ff_title.strip():
+                    title = ff_title.strip()
+
                 file_size = os.path.getsize(file_path)
                 ext = os.path.splitext(file_path)[1].lstrip(".").lower() or ("m4a" if mode == "audio" else "mp4")
                 size_mb = round(file_size / (1024 * 1024), 2)
-                caption = f"https://www.youtube.com/watch?v={video_id}\n{ext} | {size_mb}MB"
+                caption = build_caption(
+                    video_id=video_id,
+                    mode=mode,
+                    ext=ext,
+                    size_mb=size_mb,
+                    duration=duration,
+                    title=title,
+                )
                 msg = None
 
                 if mode == "audio":
